@@ -101,12 +101,19 @@ jobs:
           REPO: ${{ github.repository }}
           CURRENT_RUN: ${{ github.run_id }}
         run: |
-          echo "Keeping current run $CURRENT_RUN; deleting older artifacts..."
+          echo "Keeping current run $CURRENT_RUN; deleting older artifacts and workflow runs..."
           gh api "repos/$REPO/actions/artifacts?per_page=100" \
             --jq ".artifacts[] | select(.workflow_run.id != ($CURRENT_RUN | tonumber)) | .id" \
             | while read -r aid; do
                 [ -z "$aid" ] && continue
                 echo "Deleting artifact $aid"
                 gh api -X DELETE "repos/$REPO/actions/artifacts/$aid"
+              done
+          gh api "repos/$REPO/actions/runs?per_page=100" \
+            --jq ".workflow_runs[] | select(.id != ($CURRENT_RUN | tonumber)) | .id" \
+            | while read -r rid; do
+                [ -z "$rid" ] && continue
+                echo "Deleting workflow run $rid"
+                gh api -X DELETE "repos/$REPO/actions/runs/$rid" || echo "  failed to delete run $rid"
               done
           echo "Cleanup done."
