@@ -1,22 +1,30 @@
-name: Build WASAPI FFmpeg (win64-gpl)
+name: Build WASAPI FFmpeg (Windows)
 
 # Method B trigger only: this workflow has NO schedule. It runs either when you
 # click "Run workflow" (workflow_dispatch) or when the upstream tracker in
 # track-upstream.yml detects that BtbN/FFmpeg-Builds advanced and dispatches it.
+# Builds both x64 (win64) and ARM64 (winarm64) Windows targets in parallel.
+
 on:
   workflow_dispatch:
     inputs:
       doRelease:
-        description: "Publish a GitHub Release containing the built zip"
+        description: "Publish a GitHub Release containing the built zips"
         type: boolean
         default: false
 
 permissions:
-  contents: write   # needed only for the optional Release step
+  contents: write
+  actions: read
 
 jobs:
   build:
+    name: Build ${{ matrix.target }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [win64, winarm64]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -29,9 +37,9 @@ jobs:
             /usr/local/lib/android /opt/hostedtoolcache/CodeQL "$AGENT_TOOLSDIRECTORY" 2>/dev/null || true
           df -h /
 
-      - name: Build win64-gpl with the WASAPI input device
+      - name: Build ${{ matrix.target }}-gpl with the WASAPI input device
         run: |
-          bash ./build.sh win64 gpl > build.log 2>&1; rc=$?
+          bash ./build.sh ${{ matrix.target }} gpl > build.log 2>&1; rc=$?
           tail -n 250 build.log
           if [ "$rc" -ne 0 ]; then
             echo "::error::build failed (rc=$rc)"
@@ -44,7 +52,7 @@ jobs:
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ffmpeg-win64-gpl-wasapi
+          name: ffmpeg-${{ matrix.target }}-gpl-wasapi
           path: artifacts/*
           retention-days: 90
           if-no-files-found: error
@@ -53,15 +61,25 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: build-log
+          name: build-log-${{ matrix.target }}
           path: build.log
 
+  release:
+    name: Publish Release
+    needs: build
+    if: ${{ github.event.inputs.doRelease }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all-artifacts
+
       - name: Publish GitHub Release
-        if: ${{ github.event.inputs.doRelease }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="wasapi-$(date -u +%Y%m%d-%H%M%S)"
-          gh release create "$TAG" artifacts/* \
+          gh release create "$TAG" all-artifacts/*/*.zip \
             --title "WASAPI FFmpeg $TAG" \
-            --notes "Automated win64-gpl build with the custom WASAPI input device (libavdevice/wasapi_dec.c). Follows BtbN/FFmpeg-Builds upstream."
+            --notes "Automated Windows (x64 + ARM64) win64-gpl / winarm64-gpl builds with the custom WASAPI input device (libavdevice/wasapi_dec.c). Follows BtbN/FFmpeg-Builds upstream."
