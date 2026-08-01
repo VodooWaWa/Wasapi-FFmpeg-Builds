@@ -84,7 +84,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="wasapi-$(TZ=Asia/Shanghai date +%Y%m%d-%H%M%S)"
-          TITLE_DATE="$(TZ=Asia/Shanghai date +%Y-%m-%d-%H%M)"
+          TITLE_DATE="$(TZ=Asia/Shanghai date +%Y-%m-%d-%H:%M)"
           gh release create "$TAG" all-artifacts/*/*.zip --repo "${{ github.repository }}" --title "WASAPI FFmpeg $TITLE_DATE (北京时间)" --notes "Automated Windows (x64 + ARM64) win64-gpl / winarm64-gpl builds with the custom WASAPI input device (libavdevice/wasapi_dec.c). Follows BtbN/FFmpeg-Builds upstream."
 
   cleanup:
@@ -102,8 +102,8 @@ jobs:
           CURRENT_RUN: ${{ github.run_id }}
         run: |
           echo "Keeping current run $CURRENT_RUN; deleting older artifacts..."
-          gh api -p "repos/$REPO/actions/artifacts?per_page=100" \
-            --jq ".artifacts[] | select(.workflow_run.id != $CURRENT_RUN) | .id" \
+          gh api "repos/$REPO/actions/artifacts?per_page=100" \
+            --jq ".artifacts[] | select(.workflow_run.id != ($CURRENT_RUN | tonumber)) | .id" \
             | while read -r aid; do
                 [ -z "$aid" ] && continue
                 echo "Deleting artifact $aid"
