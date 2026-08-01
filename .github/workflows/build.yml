@@ -86,3 +86,27 @@ jobs:
           TAG="wasapi-$(TZ=Asia/Shanghai date +%Y%m%d-%H%M%S)"
           TITLE_DATE="$(TZ=Asia/Shanghai date +%Y-%m-%d-%H%M)"
           gh release create "$TAG" all-artifacts/*/*.zip --repo "${{ github.repository }}" --title "WASAPI FFmpeg $TITLE_DATE (北京时间)" --notes "Automated Windows (x64 + ARM64) win64-gpl / winarm64-gpl builds with the custom WASAPI input device (libavdevice/wasapi_dec.c). Follows BtbN/FFmpeg-Builds upstream."
+
+  cleanup:
+    name: Cleanup old artifacts
+    needs: release
+    if: ${{ github.event.inputs.doRelease }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Delete artifacts from previous runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          CURRENT_RUN: ${{ github.run_id }}
+        run: |
+          echo "Keeping current run $CURRENT_RUN; deleting older artifacts..."
+          gh api -p "repos/$REPO/actions/artifacts?per_page=100" \
+            --jq ".artifacts[] | select(.workflow_run.id != $CURRENT_RUN) | .id" \
+            | while read -r aid; do
+                [ -z "$aid" ] && continue
+                echo "Deleting artifact $aid"
+                gh api -X DELETE "repos/$REPO/actions/artifacts/$aid"
+              done
+          echo "Cleanup done."
