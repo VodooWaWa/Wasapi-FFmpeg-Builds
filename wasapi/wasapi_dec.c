@@ -670,6 +670,7 @@ static int wasapi_read_header(AVFormatContext *avctx)
     EDataFlow flow = eRender;
     HRESULT hr;
     int ret, is_loopback, process_mode = 0;
+    int detected_rate = 48000, detected_ch = 2;
 
     hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
     if (hr == RPC_E_CHANGED_MODE) {
@@ -772,10 +773,29 @@ static int wasapi_read_header(AVFormatContext *avctx)
     }
 
     if (process_mode) {
-        /* Process loopback cannot negotiate a mix format, it must be told one. */
+        /* Auto-detect the audio engine's real mix format so we do not force a
+         * sample rate or channel count that would trigger an extra resample /
+         * downmix inside the engine (which is what produced crackle before).
+         * Fall back to a safe default if the virtual device will not report one. */
+        hr = IAudioClient_GetMixFormat(s->client, &mix);
+        if (SUCCEEDED(hr) && mix) {
+            detected_rate = (int)mix->nSamplesPerSec;
+            detected_ch   = mix->nChannels;
+            av_log(avctx, AV_LOG_INFO,
+                   "Process loopback: detected mix format %d Hz, %d channels\n",
+                   detected_rate, detected_ch);
+            CoTaskMemFree(mix);
+            mix = NULL;
+        } else {
+            av_log(avctx, AV_LOG_INFO,
+                   "Process loopback: could not query mix format, defaulting to "
+                   "48000 Hz, 2 channels\n");
+            if (mix) { CoTaskMemFree(mix); mix = NULL; }
+        }
+
         fill_waveformat(&forced,
-                        s->req_sample_rate > 0 ? s->req_sample_rate : 48000,
-                        s->req_channels    > 0 ? s->req_channels    : 2,
+                        s->req_sample_rate > 0 ? s->req_sample_rate : detected_rate,
+                        s->req_channels    > 0 ? s->req_channels    : detected_ch,
                         s->req_sample_fmt == 1 ? 0 : 1);
         wf = &forced.Format;
     } else if (s->req_sample_rate > 0 || s->req_channels > 0 || s->req_sample_fmt == 1) {
@@ -822,8 +842,8 @@ static int wasapi_read_header(AVFormatContext *avctx)
         av_log(avctx, AV_LOG_WARNING,
                "Float capture rejected for process loopback, retrying with 16 bit PCM\n");
         fill_waveformat(&forced,
-                        s->req_sample_rate > 0 ? s->req_sample_rate : 48000,
-                        s->req_channels    > 0 ? s->req_channels    : 2, 0);
+                        s->req_sample_rate > 0 ? s->req_sample_rate : detected_rate,
+                        s->req_channels    > 0 ? s->req_channels    : detected_ch, 0);
         wf  = &forced.Format;
         ret = waveformat_to_codec(avctx, wf, &codec_id, &mask);
         if (ret < 0)
@@ -1077,8 +1097,8 @@ static const AVOption options[] = {
         OFFSET(pid), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, DEC },
     { "exclude_pid", "capture everything except the given process id",
         OFFSET(exclude_pid), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, DEC },
-    { "fill_silence", "insert silence while the endpoint is idle",
-        OFFSET(fill_silence), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, DEC },
+    { "fill_silence", "insert silence while the endpoint is idle (default off; enable to keep a continuous timeline)",
+        OFFSET(fill_silence), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, DEC },
     { "silence_threshold", "idle time in milliseconds before silence is inserted",
         OFFSET(silence_ms), AV_OPT_TYPE_INT, { .i64 = 100 }, 10, 10000, DEC },
     { "sample_rate", "force a sample rate",
