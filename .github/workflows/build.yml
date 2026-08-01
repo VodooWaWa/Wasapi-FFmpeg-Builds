@@ -83,4 +83,4 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ github.run_number }}" all-artifacts/*/*.zip --title "WASAPI FFmpeg ${{ github.run_number }}" --notes "Automated Windows (x64 + ARM64) win64-gpl / winarm64-gpl builds with the custom WASAPI input device (libavdevice/wasapi_dec.c). Follows BtbN/FFmpeg-Builds upstream."
+          gh release create "${{ github.run_number }}" all-artifacts/*/*.zip --repo "${{ github.repository }}" --title "WASAPI FFmpeg ${{ github.run_number }}" --notes "Automated Windows (x64 + ARM64) win64-gpl / winarm64-gpl builds with the custom WASAPI input device (libavdevice/wasapi_dec.c). Follows BtbN/FFmpeg-Builds upstream."
