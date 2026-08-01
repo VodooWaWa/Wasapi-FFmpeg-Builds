@@ -83,4 +83,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ github.run_number }}" all-artifacts/*/*.zip --repo "${{ github.repository }}" --title "WASAPI FFmpeg ${{ github.run_number }}" --notes "Automated Windows (x64 + ARM64) win64-gpl / winarm64-gpl builds with the custom WASAPI input device (libavdevice/wasapi_dec.c). Follows BtbN/FFmpeg-Builds upstream."
+          TAG="wasapi-$(TZ=Asia/Shanghai date +%Y%m%d-%H%M%S)"
+          TITLE_DATE="$(TZ=Asia/Shanghai date +%Y-%m-%d-%H%M)"
+          gh release create "$TAG" all-artifacts/*/*.zip --repo "${{ github.repository }}" --title "WASAPI FFmpeg $TITLE_DATE (北京时间)" --notes "Automated Windows (x64 + ARM64) win64-gpl / winarm64-gpl builds with the custom WASAPI input device (libavdevice/wasapi_dec.c). Follows BtbN/FFmpeg-Builds upstream."
