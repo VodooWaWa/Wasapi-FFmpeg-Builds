@@ -2,3 +2,7 @@
 /ffbuild/
 /artifacts/
 /.cache/
+/dist/
+/build-win64-gpl.log
+/build.log
+/wasapi/out/

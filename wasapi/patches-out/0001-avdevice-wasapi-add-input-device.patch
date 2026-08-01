@@ -1,0 +1,1284 @@
+From 9ce1a8c86f703329c5368bee4339f3377f0bc6a6 Mon Sep 17 00:00:00 2001
+From: wasapi <wasapi@local>
+Date: Fri, 31 Jul 2026 17:13:17 +0000
+Subject: [PATCH] avdevice/wasapi: add WASAPI audio capture input device
+
+Adds a WASAPI input device for Windows supporting:
+ - loopback capture of render endpoints (record system audio without a
+   virtual sound card)
+ - normal capture endpoints (microphone / line in)
+ - shared and exclusive mode
+ - per-process capture on Windows 10 build 20348+ (pid=)
+ - silence padding while an endpoint is idle
+
+Usage:
+  ffmpeg -f wasapi -list_devices true -i dummy
+  ffmpeg -f wasapi -i default -c:a flac out.flac
+  ffmpeg -f wasapi -i pid=1234 -c:a aac app.m4a
+---
+ configure                |    3 +
+ doc/indevs.texi          |   85 +++
+ libavdevice/Makefile     |    1 +
+ libavdevice/alldevices.c |    1 +
+ libavdevice/wasapi_dec.c | 1111 ++++++++++++++++++++++++++++++++++++++
+ 5 files changed, 1201 insertions(+)
+ create mode 100755 libavdevice/wasapi_dec.c
+
+diff --git a/configure b/configure
+index 61a948d..fc9969d 100755
+--- a/configure
++++ b/configure
+@@ -4028,6 +4028,8 @@ decklink_outdev_suggest="libklvanc"
+ decklink_outdev_extralibs="-lstdc++"
+ dshow_indev_deps="IBaseFilter"
+ dshow_indev_extralibs="-lpsapi -lole32 -lstrmiids -luuid -loleaut32 -lshlwapi"
++wasapi_indev_deps="IAudioClient"
++wasapi_indev_extralibs="-lole32 -loleaut32 -luuid"
+ fbdev_indev_deps="linux_fb_h"
+ fbdev_outdev_deps="linux_fb_h"
+ gdigrab_indev_deps="CreateDIBSection"
+@@ -7648,6 +7650,7 @@ check_lib vfw32 "windows.h vfw.h" capCreateCaptureWindow -lvfw32
+ check_cpp_condition vfwcap_defines vfw.h "WM_CAP_DRIVER_CONNECT > WM_USER"
+ 
+ check_type "dshow.h" IBaseFilter
++    check_type "windows.h initguid.h mmdeviceapi.h audioclient.h" IAudioClient
+ 
+ if check_struct sys/soundcard.h audio_buf_info bytes; then
+     enable_sanitized sys/soundcard.h
+diff --git a/doc/indevs.texi b/doc/indevs.texi
+index 7c3c711..ac0c27e 100644
+--- a/doc/indevs.texi
++++ b/doc/indevs.texi
+@@ -1596,3 +1596,88 @@ default value for both options is 0.
+ @end table
+ 
+ @c man end INPUT DEVICES
++
++@section wasapi
++
++Windows Audio Session API (WASAPI) input device.
++
++Unlike @code{dshow}, this device can record what a playback endpoint is
++@emph{outputting} (loopback capture), which is the usual way to record system
++audio without installing a virtual sound card.
++
++The input name selects the endpoint:
++
++@table @option
++@item default
++@itemx default_output
++The default playback device, captured in loopback mode. This is the default.
++@item default_input
++The default recording device, for example a microphone.
++@item @var{name}
++A device name as printed by @option{-list_devices}, matched exactly first and
++then case insensitively as a substring. Endpoint ids are accepted as well.
++@item pid=@var{number}
++Capture only the audio produced by the given process and its children.
++Requires Windows 10 build 20348 or newer.
++@end table
++
++@subsection Options
++
++@table @option
++@item -list_devices @var{true}
++List the available endpoints and exit.
++
++@item -loopback @var{bool}
++Force loopback capture on or off. By default it is enabled for playback
++endpoints and disabled for recording endpoints.
++
++@item -exclusive @var{bool}
++Open the endpoint in exclusive mode. Cannot be combined with loopback.
++
++@item -audio_buffer_size @var{milliseconds}
++Size of the capture buffer, 500 by default.
++
++@item -pid @var{number}
++Capture a single process. Equivalent to the @code{pid=} input name.
++
++@item -exclude_pid @var{bool}
++Invert @option{-pid}, capturing everything except the given process.
++
++@item -fill_silence @var{bool}
++Emit digital silence while the endpoint is idle so that the recording keeps
++running in real time. Enabled by default; a loopback endpoint delivers no data
++at all when nothing is playing.
++
++@item -silence_threshold @var{milliseconds}
++How long the endpoint has to stay idle before silence is inserted, 100 by
++default.
++
++@item -sample_rate @var{rate}
++@itemx -channels @var{count}
++@itemx -format @var{float|s16}
++Request a specific format instead of the shared mode mix format.
++@end table
++
++@subsection Examples
++
++@itemize
++@item List the endpoints:
++@example
++ffmpeg -f wasapi -list_devices true -i dummy
++@end example
++
++@item Record everything the computer plays:
++@example
++ffmpeg -f wasapi -i default -c:a flac out.flac
++@end example
++
++@item Record a microphone:
++@example
++ffmpeg -f wasapi -i default_input -c:a aac mic.m4a
++@end example
++
++@item Record only what one process plays:
++@example
++ffmpeg -f wasapi -i pid=12345 -c:a aac app.m4a
++@end example
++@end itemize
+diff --git a/libavdevice/Makefile b/libavdevice/Makefile
+index 256c8e7..bb9da17 100644
+--- a/libavdevice/Makefile
++++ b/libavdevice/Makefile
+@@ -45,6 +45,7 @@ OBJS-$(CONFIG_SNDIO_OUTDEV)              += sndio_enc.o sndio.o
+ OBJS-$(CONFIG_V4L2_INDEV)                += v4l2.o v4l2-common.o timefilter.o
+ OBJS-$(CONFIG_V4L2_OUTDEV)               += v4l2enc.o v4l2-common.o
+ OBJS-$(CONFIG_VFWCAP_INDEV)              += vfwcap.o
++OBJS-$(CONFIG_WASAPI_INDEV)              += wasapi_dec.o
+ OBJS-$(CONFIG_XCBGRAB_INDEV)             += xcbgrab.o
+ OBJS-$(CONFIG_XV_OUTDEV)                 += xv.o
+ 
+diff --git a/libavdevice/alldevices.c b/libavdevice/alldevices.c
+index 573595f..4d9778d 100644
+--- a/libavdevice/alldevices.c
++++ b/libavdevice/alldevices.c
+@@ -53,6 +53,7 @@ extern const FFOutputFormat ff_sndio_muxer;
+ extern const FFInputFormat  ff_v4l2_demuxer;
+ extern const FFOutputFormat ff_v4l2_muxer;
+ extern const FFInputFormat  ff_vfwcap_demuxer;
++extern const FFInputFormat  ff_wasapi_demuxer;
+ extern const FFInputFormat  ff_xcbgrab_demuxer;
+ extern const FFOutputFormat ff_xv_muxer;
+ 
+diff --git a/libavdevice/wasapi_dec.c b/libavdevice/wasapi_dec.c
+new file mode 100755
+index 0000000..ec11978
+--- /dev/null
++++ b/libavdevice/wasapi_dec.c
+@@ -0,0 +1,1111 @@
++/*
++ * WASAPI audio input device
++ *
++ * Supports:
++ *   - loopback capture of any render (playback) endpoint  -> record system audio
++ *   - regular capture endpoints (microphones, line in)
++ *   - shared and exclusive mode
++ *   - per-process loopback capture (Windows 10 build 20348+ / Windows 11)
++ *   - silence padding so that the timeline does not collapse while nothing plays
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#define COBJMACROS
++#define INITGUID
++
++#include <limits.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include <windows.h>
++#include <initguid.h>
++#include <mmdeviceapi.h>
++#include <audioclient.h>
++#include <mmreg.h>
++#include <propidl.h>
++
++#include "libavutil/attributes.h"
++#include "libavutil/avstring.h"
++#include "libavutil/channel_layout.h"
++#include "libavutil/common.h"
++#include "libavutil/mathematics.h"
++#include "libavutil/mem.h"
++#include "libavutil/opt.h"
++#include "libavutil/time.h"
++#include "libavcodec/avcodec.h"
++#include "libavformat/avformat.h"
++#include "libavformat/demux.h"
++#include "libavformat/internal.h"
++#include "avdevice.h"
++
++/* mmreg.h in some mingw-w64 releases does not carry the speaker positions. */
++#ifndef SPEAKER_FRONT_LEFT
++#define SPEAKER_FRONT_LEFT   0x1
++#define SPEAKER_FRONT_RIGHT  0x2
++#define SPEAKER_FRONT_CENTER 0x4
++#endif
++
++/* Locally defined so that we do not depend on the mingw-w64 version shipping
++ * ksmedia.h / functiondiscoverykeys_devpkey.h with matching definitions. */
++DEFINE_GUID(ff_KSDATAFORMAT_SUBTYPE_PCM,
++            0x00000001, 0x0000, 0x0010, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71);
++DEFINE_GUID(ff_KSDATAFORMAT_SUBTYPE_IEEE_FLOAT,
++            0x00000003, 0x0000, 0x0010, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71);
++
++static const PROPERTYKEY ff_PKEY_Device_FriendlyName = {
++    { 0xa45c254e, 0xdf1c, 0x4efd, { 0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0 } }, 14
++};
++
++/* ------------------------------------------------------------------------ */
++/* Process loopback plumbing (Windows 10 build 20348+).                      */
++/* Declared locally and resolved at runtime so the resulting binary still    */
++/* starts on older Windows versions.                                         */
++/* ------------------------------------------------------------------------ */
++
++#define FF_VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK L"VAD\\Process_Loopback"
++
++typedef enum {
++    FF_PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE = 0,
++    FF_PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE = 1,
++} FF_PROCESS_LOOPBACK_MODE;
++
++typedef struct {
++    DWORD                    TargetProcessId;
++    FF_PROCESS_LOOPBACK_MODE ProcessLoopbackMode;
++} FF_AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS;
++
++typedef enum {
++    FF_AUDIOCLIENT_ACTIVATION_TYPE_DEFAULT         = 0,
++    FF_AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK = 1,
++} FF_AUDIOCLIENT_ACTIVATION_TYPE;
++
++typedef struct {
++    FF_AUDIOCLIENT_ACTIVATION_TYPE ActivationType;
++    union {
++        FF_AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS ProcessLoopbackParams;
++    };
++} FF_AUDIOCLIENT_ACTIVATION_PARAMS;
++
++typedef struct FFIActivateAudioInterfaceAsyncOperation FFIActivateAudioInterfaceAsyncOperation;
++
++typedef struct FFIActivateAudioInterfaceAsyncOperationVtbl {
++    HRESULT (STDMETHODCALLTYPE *QueryInterface)(FFIActivateAudioInterfaceAsyncOperation *, REFIID, void **);
++    ULONG   (STDMETHODCALLTYPE *AddRef)(FFIActivateAudioInterfaceAsyncOperation *);
++    ULONG   (STDMETHODCALLTYPE *Release)(FFIActivateAudioInterfaceAsyncOperation *);
++    HRESULT (STDMETHODCALLTYPE *GetActivateResult)(FFIActivateAudioInterfaceAsyncOperation *, HRESULT *, IUnknown **);
++} FFIActivateAudioInterfaceAsyncOperationVtbl;
++
++struct FFIActivateAudioInterfaceAsyncOperation {
++    const FFIActivateAudioInterfaceAsyncOperationVtbl *lpVtbl;
++};
++
++typedef struct FFIActivateAudioInterfaceCompletionHandler FFIActivateAudioInterfaceCompletionHandler;
++
++typedef struct FFIActivateAudioInterfaceCompletionHandlerVtbl {
++    HRESULT (STDMETHODCALLTYPE *QueryInterface)(FFIActivateAudioInterfaceCompletionHandler *, REFIID, void **);
++    ULONG   (STDMETHODCALLTYPE *AddRef)(FFIActivateAudioInterfaceCompletionHandler *);
++    ULONG   (STDMETHODCALLTYPE *Release)(FFIActivateAudioInterfaceCompletionHandler *);
++    HRESULT (STDMETHODCALLTYPE *ActivateCompleted)(FFIActivateAudioInterfaceCompletionHandler *,
++                                                   FFIActivateAudioInterfaceAsyncOperation *);
++} FFIActivateAudioInterfaceCompletionHandlerVtbl;
++
++struct FFIActivateAudioInterfaceCompletionHandler {
++    const FFIActivateAudioInterfaceCompletionHandlerVtbl *lpVtbl;
++    LONG   refcount;
++    HANDLE event;
++};
++
++DEFINE_GUID(ff_IID_IActivateAudioInterfaceCompletionHandler,
++            0x41d949ab, 0x9862, 0x444a, 0x80, 0xf6, 0xc2, 0x61, 0x33, 0x4d, 0xa5, 0xeb);
++DEFINE_GUID(ff_IID_IAgileObject,
++            0x94ea2b94, 0xe9cc, 0x49e0, 0xc0, 0xff, 0xee, 0x64, 0xca, 0x8f, 0x5b, 0x90);
++
++typedef HRESULT (STDAPICALLTYPE *ff_ActivateAudioInterfaceAsync_t)(
++    LPCWSTR, REFIID, PROPVARIANT *,
++    FFIActivateAudioInterfaceCompletionHandler *,
++    FFIActivateAudioInterfaceAsyncOperation **);
++
++/* ------------------------------------------------------------------------ */
++
++typedef struct WasapiContext {
++    const AVClass *class;
++
++    /* options */
++    int      list_devices;
++    int      loopback;          /* -1 auto, 0 off, 1 on */
++    int      exclusive;
++    int      buffer_ms;
++    int      pid;
++    int      exclude_pid;
++    int      fill_silence;
++    int      silence_ms;
++    int      req_sample_rate;
++    int      req_channels;
++    int      req_sample_fmt;    /* 0 = auto/float, 1 = s16 */
++
++    /* COM state */
++    int                   com_initialized;
++    IMMDeviceEnumerator  *enumerator;
++    IMMDevice            *device;
++    IAudioClient         *client;
++    IAudioCaptureClient  *capture;
++    HANDLE                event;
++    HMODULE               mmdevapi;
++
++    /* stream state */
++    int      sample_rate;
++    int      channels;
++    int      frame_size;        /* bytes per frame (all channels) */
++    int64_t  next_pts;          /* in samples */
++    int64_t  start_time;        /* av_gettime_relative() at start */
++    int      started;
++    int      eof;
++} WasapiContext;
++
++/* ------------------------------------------------------------------------ */
++/* helpers                                                                   */
++/* ------------------------------------------------------------------------ */
++
++static const char *hr2str(HRESULT hr)
++{
++    switch (hr) {
++    case S_OK:                                  return "S_OK";
++    case E_INVALIDARG:                          return "E_INVALIDARG";
++    case E_OUTOFMEMORY:                         return "E_OUTOFMEMORY";
++    case E_POINTER:                             return "E_POINTER";
++    case E_NOINTERFACE:                         return "E_NOINTERFACE";
++    case E_ACCESSDENIED:                        return "E_ACCESSDENIED";
++    case AUDCLNT_E_NOT_INITIALIZED:             return "AUDCLNT_E_NOT_INITIALIZED";
++    case AUDCLNT_E_ALREADY_INITIALIZED:         return "AUDCLNT_E_ALREADY_INITIALIZED";
++    case AUDCLNT_E_WRONG_ENDPOINT_TYPE:         return "AUDCLNT_E_WRONG_ENDPOINT_TYPE";
++    case AUDCLNT_E_DEVICE_INVALIDATED:          return "AUDCLNT_E_DEVICE_INVALIDATED";
++    case AUDCLNT_E_NOT_STOPPED:                 return "AUDCLNT_E_NOT_STOPPED";
++    case AUDCLNT_E_BUFFER_TOO_LARGE:            return "AUDCLNT_E_BUFFER_TOO_LARGE";
++    case AUDCLNT_E_OUT_OF_ORDER:                return "AUDCLNT_E_OUT_OF_ORDER";
++    case AUDCLNT_E_UNSUPPORTED_FORMAT:          return "AUDCLNT_E_UNSUPPORTED_FORMAT";
++    case AUDCLNT_E_INVALID_SIZE:                return "AUDCLNT_E_INVALID_SIZE";
++    case AUDCLNT_E_DEVICE_IN_USE:               return "AUDCLNT_E_DEVICE_IN_USE";
++    case AUDCLNT_E_BUFFER_OPERATION_PENDING:    return "AUDCLNT_E_BUFFER_OPERATION_PENDING";
++    case AUDCLNT_E_THREAD_NOT_REGISTERED:       return "AUDCLNT_E_THREAD_NOT_REGISTERED";
++    case AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED:  return "AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED";
++    case AUDCLNT_E_ENDPOINT_CREATE_FAILED:      return "AUDCLNT_E_ENDPOINT_CREATE_FAILED";
++    case AUDCLNT_E_SERVICE_NOT_RUNNING:         return "AUDCLNT_E_SERVICE_NOT_RUNNING";
++    case AUDCLNT_E_EVENTHANDLE_NOT_EXPECTED:    return "AUDCLNT_E_EVENTHANDLE_NOT_EXPECTED";
++    case AUDCLNT_E_EXCLUSIVE_MODE_ONLY:         return "AUDCLNT_E_EXCLUSIVE_MODE_ONLY";
++    case AUDCLNT_E_BUFDURATION_PERIOD_NOT_EQUAL:return "AUDCLNT_E_BUFDURATION_PERIOD_NOT_EQUAL";
++    case AUDCLNT_E_EVENTHANDLE_NOT_SET:         return "AUDCLNT_E_EVENTHANDLE_NOT_SET";
++    case AUDCLNT_E_INCORRECT_BUFFER_SIZE:       return "AUDCLNT_E_INCORRECT_BUFFER_SIZE";
++    case AUDCLNT_E_BUFFER_SIZE_ERROR:           return "AUDCLNT_E_BUFFER_SIZE_ERROR";
++    case AUDCLNT_E_CPUUSAGE_EXCEEDED:           return "AUDCLNT_E_CPUUSAGE_EXCEEDED";
++    case AUDCLNT_E_BUFFER_ERROR:                return "AUDCLNT_E_BUFFER_ERROR";
++    case AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED:     return "AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED";
++    case AUDCLNT_E_INVALID_DEVICE_PERIOD:       return "AUDCLNT_E_INVALID_DEVICE_PERIOD";
++    case AUDCLNT_E_RESOURCES_INVALIDATED:       return "AUDCLNT_E_RESOURCES_INVALIDATED";
++    default:                                    return "unknown error";
++    }
++}
++
++static char *wchar_to_utf8(const wchar_t *w)
++{
++    char *out;
++    int len;
++
++    if (!w)
++        return NULL;
++
++    len = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
++    if (len <= 0)
++        return NULL;
++
++    out = av_mallocz(len);
++    if (!out)
++        return NULL;
++
++    if (WideCharToMultiByte(CP_UTF8, 0, w, -1, out, len, NULL, NULL) <= 0) {
++        av_free(out);
++        return NULL;
++    }
++
++    return out;
++}
++
++av_unused static wchar_t *utf8_to_wchar(const char *s)
++{
++    wchar_t *out;
++    int len;
++
++    if (!s)
++        return NULL;
++
++    len = MultiByteToWideChar(CP_UTF8, 0, s, -1, NULL, 0);
++    if (len <= 0)
++        return NULL;
++
++    out = av_mallocz(len * sizeof(wchar_t));
++    if (!out)
++        return NULL;
++
++    if (MultiByteToWideChar(CP_UTF8, 0, s, -1, out, len) <= 0) {
++        av_free(out);
++        return NULL;
++    }
++
++    return out;
++}
++
++/* Retrieve the human readable name of an endpoint. Caller frees. */
++static char *device_friendly_name(IMMDevice *dev)
++{
++    IPropertyStore *props = NULL;
++    PROPVARIANT var;
++    char *name = NULL;
++
++    if (FAILED(IMMDevice_OpenPropertyStore(dev, STGM_READ, &props)))
++        return NULL;
++
++    PropVariantInit(&var);
++    if (SUCCEEDED(IPropertyStore_GetValue(props, &ff_PKEY_Device_FriendlyName, &var)) &&
++        var.vt == VT_LPWSTR)
++        name = wchar_to_utf8(var.pwszVal);
++
++    PropVariantClear(&var);
++    IPropertyStore_Release(props);
++
++    return name;
++}
++
++static char *device_id_utf8(IMMDevice *dev)
++{
++    LPWSTR wid = NULL;
++    char *id;
++
++    if (FAILED(IMMDevice_GetId(dev, &wid)))
++        return NULL;
++
++    id = wchar_to_utf8(wid);
++    CoTaskMemFree(wid);
++
++    return id;
++}
++
++/* ------------------------------------------------------------------------ */
++/* device listing / lookup                                                   */
++/* ------------------------------------------------------------------------ */
++
++static void list_endpoints(AVFormatContext *avctx, EDataFlow flow, const char *title)
++{
++    WasapiContext *s = avctx->priv_data;
++    IMMDeviceCollection *coll = NULL;
++    IMMDevice *defdev = NULL;
++    char *defid = NULL;
++    UINT count = 0, i;
++
++    if (FAILED(IMMDeviceEnumerator_EnumAudioEndpoints(s->enumerator, flow,
++                                                      DEVICE_STATE_ACTIVE, &coll)))
++        return;
++
++    if (SUCCEEDED(IMMDeviceEnumerator_GetDefaultAudioEndpoint(s->enumerator, flow,
++                                                              eConsole, &defdev))) {
++        defid = device_id_utf8(defdev);
++        IMMDevice_Release(defdev);
++    }
++
++    IMMDeviceCollection_GetCount(coll, &count);
++    av_log(avctx, AV_LOG_INFO, "%s\n", title);
++
++    for (i = 0; i < count; i++) {
++        IMMDevice *dev = NULL;
++        char *name, *id;
++
++        if (FAILED(IMMDeviceCollection_Item(coll, i, &dev)))
++            continue;
++
++        name = device_friendly_name(dev);
++        id   = device_id_utf8(dev);
++
++        av_log(avctx, AV_LOG_INFO, "  \"%s\"%s\n",
++               name ? name : "unknown",
++               (defid && id && !strcmp(defid, id)) ? "  (default)" : "");
++        av_log(avctx, AV_LOG_INFO, "     id: \"%s\"\n", id ? id : "unknown");
++
++        av_free(name);
++        av_free(id);
++        IMMDevice_Release(dev);
++    }
++
++    av_free(defid);
++    IMMDeviceCollection_Release(coll);
++}
++
++static int do_list_devices(AVFormatContext *avctx)
++{
++    list_endpoints(avctx, eRender,
++                   "WASAPI render (playback) devices -- capture these with loopback:");
++    list_endpoints(avctx, eCapture,
++                   "WASAPI capture (recording) devices:");
++    av_log(avctx, AV_LOG_INFO,
++           "Use \"default\" / \"default_output\" for the default playback device (loopback),\n"
++           "    \"default_input\" for the default recording device,\n"
++           "    \"pid=<number>\" to capture a single process (Windows 11 / Server 2022+).\n");
++    return AVERROR_EXIT;
++}
++
++/* Find an endpoint by friendly name or by endpoint id. */
++static int find_device(AVFormatContext *avctx, const char *wanted,
++                       EDataFlow flow, IMMDevice **out)
++{
++    WasapiContext *s = avctx->priv_data;
++    IMMDeviceCollection *coll = NULL;
++    IMMDevice *fallback = NULL;
++    UINT count = 0, i;
++    int ret = AVERROR(ENODEV);
++
++    if (FAILED(IMMDeviceEnumerator_EnumAudioEndpoints(s->enumerator, flow,
++                                                      DEVICE_STATE_ACTIVE, &coll)))
++        return AVERROR_EXTERNAL;
++
++    IMMDeviceCollection_GetCount(coll, &count);
++
++    for (i = 0; i < count; i++) {
++        IMMDevice *dev = NULL;
++        char *name, *id;
++        int exact = 0, partial = 0;
++
++        if (FAILED(IMMDeviceCollection_Item(coll, i, &dev)))
++            continue;
++
++        name = device_friendly_name(dev);
++        id   = device_id_utf8(dev);
++
++        if ((id   && !strcmp(id, wanted)) ||
++            (name && !strcmp(name, wanted)))
++            exact = 1;
++        else if (name && av_stristr(name, wanted))
++            partial = 1;
++
++        av_free(name);
++        av_free(id);
++
++        if (exact) {
++            if (fallback)
++                IMMDevice_Release(fallback);
++            *out = dev;
++            ret = 0;
++            break;
++        }
++
++        if (partial && !fallback) {
++            fallback = dev;
++            continue;
++        }
++
++        IMMDevice_Release(dev);
++    }
++
++    if (ret < 0 && fallback) {
++        *out = fallback;
++        ret = 0;
++    } else if (ret == 0 && fallback && *out != fallback) {
++        IMMDevice_Release(fallback);
++    }
++
++    IMMDeviceCollection_Release(coll);
++
++    return ret;
++}
++
++/* ------------------------------------------------------------------------ */
++/* process loopback activation                                               */
++/* ------------------------------------------------------------------------ */
++
++static HRESULT STDMETHODCALLTYPE handler_QueryInterface(
++    FFIActivateAudioInterfaceCompletionHandler *self, REFIID riid, void **obj)
++{
++    if (!obj)
++        return E_POINTER;
++
++    if (IsEqualGUID(riid, &IID_IUnknown) ||
++        IsEqualGUID(riid, &ff_IID_IActivateAudioInterfaceCompletionHandler) ||
++        IsEqualGUID(riid, &ff_IID_IAgileObject)) {
++        *obj = self;
++        InterlockedIncrement(&self->refcount);
++        return S_OK;
++    }
++
++    *obj = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG STDMETHODCALLTYPE handler_AddRef(FFIActivateAudioInterfaceCompletionHandler *self)
++{
++    return InterlockedIncrement(&self->refcount);
++}
++
++static ULONG STDMETHODCALLTYPE handler_Release(FFIActivateAudioInterfaceCompletionHandler *self)
++{
++    return InterlockedDecrement(&self->refcount);
++}
++
++static HRESULT STDMETHODCALLTYPE handler_ActivateCompleted(
++    FFIActivateAudioInterfaceCompletionHandler *self,
++    FFIActivateAudioInterfaceAsyncOperation *op)
++{
++    SetEvent(self->event);
++    return S_OK;
++}
++
++static const FFIActivateAudioInterfaceCompletionHandlerVtbl handler_vtbl = {
++    handler_QueryInterface,
++    handler_AddRef,
++    handler_Release,
++    handler_ActivateCompleted,
++};
++
++static int activate_process_loopback(AVFormatContext *avctx, IAudioClient **out)
++{
++    WasapiContext *s = avctx->priv_data;
++    ff_ActivateAudioInterfaceAsync_t activate_async;
++    FFIActivateAudioInterfaceCompletionHandler *handler = NULL;
++    FFIActivateAudioInterfaceAsyncOperation *op = NULL;
++    FF_AUDIOCLIENT_ACTIVATION_PARAMS params = { 0 };
++    PROPVARIANT prop;
++    HRESULT hr, activate_hr = E_FAIL;
++    IUnknown *unk = NULL;
++    int ret = 0;
++
++    s->mmdevapi = LoadLibraryW(L"mmdevapi.dll");
++    if (!s->mmdevapi) {
++        av_log(avctx, AV_LOG_ERROR, "Could not load mmdevapi.dll\n");
++        return AVERROR_EXTERNAL;
++    }
++
++    activate_async = (ff_ActivateAudioInterfaceAsync_t)
++        (void *)GetProcAddress(s->mmdevapi, "ActivateAudioInterfaceAsync");
++    if (!activate_async) {
++        av_log(avctx, AV_LOG_ERROR,
++               "Per-process capture requires Windows 10 build 20348 or newer "
++               "(ActivateAudioInterfaceAsync is unavailable on this system).\n");
++        return AVERROR(ENOSYS);
++    }
++
++    /* Heap allocated on purpose: if the activation ever times out, COM may still
++     * invoke the callback later, and a stack object would be long gone by then. */
++    handler = av_mallocz(sizeof(*handler));
++    if (!handler)
++        return AVERROR(ENOMEM);
++
++    handler->lpVtbl   = &handler_vtbl;
++    handler->refcount = 1;
++    handler->event    = CreateEventW(NULL, FALSE, FALSE, NULL);
++    if (!handler->event) {
++        av_free(handler);
++        return AVERROR(ENOMEM);
++    }
++
++    params.ActivationType = FF_AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK;
++    params.ProcessLoopbackParams.TargetProcessId     = (DWORD)s->pid;
++    params.ProcessLoopbackParams.ProcessLoopbackMode = s->exclude_pid ?
++        FF_PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE :
++        FF_PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE;
++
++    PropVariantInit(&prop);
++    prop.vt              = VT_BLOB;
++    prop.blob.cbSize     = sizeof(params);
++    prop.blob.pBlobData  = (BYTE *)&params;
++
++    hr = activate_async(FF_VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
++                        &IID_IAudioClient, &prop, handler, &op);
++    if (FAILED(hr)) {
++        av_log(avctx, AV_LOG_ERROR,
++               "ActivateAudioInterfaceAsync failed: %s (0x%08lX)\n",
++               hr2str(hr), (unsigned long)hr);
++        ret = AVERROR_EXTERNAL;
++        goto end;
++    }
++
++    if (WaitForSingleObject(handler->event, 5000) != WAIT_OBJECT_0) {
++        av_log(avctx, AV_LOG_ERROR, "Timed out activating process loopback capture\n");
++        ret = AVERROR(ETIMEDOUT);
++        goto end;
++    }
++
++    hr = op->lpVtbl->GetActivateResult(op, &activate_hr, &unk);
++    if (FAILED(hr) || FAILED(activate_hr)) {
++        HRESULT bad = FAILED(hr) ? hr : activate_hr;
++        av_log(avctx, AV_LOG_ERROR,
++               "Process loopback activation failed: %s (0x%08lX). "
++               "Does pid %d exist and is it playing audio?\n",
++               hr2str(bad), (unsigned long)bad, s->pid);
++        ret = AVERROR_EXTERNAL;
++        goto end;
++    }
++
++    hr = IUnknown_QueryInterface(unk, &IID_IAudioClient, (void **)out);
++    if (FAILED(hr)) {
++        av_log(avctx, AV_LOG_ERROR, "Could not obtain IAudioClient: %s\n", hr2str(hr));
++        ret = AVERROR_EXTERNAL;
++    }
++
++end:
++    if (unk)
++        IUnknown_Release(unk);
++    if (op)
++        op->lpVtbl->Release(op);
++    if (handler && InterlockedDecrement(&handler->refcount) <= 0) {
++        CloseHandle(handler->event);
++        av_free(handler);
++    }   /* else COM still holds a reference; leaking beats a dangling callback */
++
++    return ret;
++}
++
++/* ------------------------------------------------------------------------ */
++/* format handling                                                           */
++/* ------------------------------------------------------------------------ */
++
++static int waveformat_to_codec(AVFormatContext *avctx, const WAVEFORMATEX *wf,
++                               enum AVCodecID *codec_id, uint64_t *mask)
++{
++    const WAVEFORMATEXTENSIBLE *wfe = NULL;
++    WORD tag = wf->wFormatTag;
++
++    *mask = 0;
++
++    if (tag == WAVE_FORMAT_EXTENSIBLE && wf->cbSize >= 22) {
++        wfe   = (const WAVEFORMATEXTENSIBLE *)wf;
++        *mask = wfe->dwChannelMask;
++
++        if (IsEqualGUID(&wfe->SubFormat, &ff_KSDATAFORMAT_SUBTYPE_IEEE_FLOAT))
++            tag = WAVE_FORMAT_IEEE_FLOAT;
++        else if (IsEqualGUID(&wfe->SubFormat, &ff_KSDATAFORMAT_SUBTYPE_PCM))
++            tag = WAVE_FORMAT_PCM;
++        else {
++            av_log(avctx, AV_LOG_ERROR, "Unsupported WASAPI subformat\n");
++            return AVERROR(ENOSYS);
++        }
++    }
++
++    if (tag == WAVE_FORMAT_IEEE_FLOAT) {
++        if (wf->wBitsPerSample == 32)
++            *codec_id = AV_CODEC_ID_PCM_F32LE;
++        else if (wf->wBitsPerSample == 64)
++            *codec_id = AV_CODEC_ID_PCM_F64LE;
++        else
++            goto unsupported;
++    } else if (tag == WAVE_FORMAT_PCM) {
++        switch (wf->wBitsPerSample) {
++        case 8:  *codec_id = AV_CODEC_ID_PCM_U8;    break;
++        case 16: *codec_id = AV_CODEC_ID_PCM_S16LE; break;
++        case 24: *codec_id = AV_CODEC_ID_PCM_S24LE; break;
++        case 32: *codec_id = AV_CODEC_ID_PCM_S32LE; break;
++        default: goto unsupported;
++        }
++    } else {
++        goto unsupported;
++    }
++
++    return 0;
++
++unsupported:
++    av_log(avctx, AV_LOG_ERROR,
++           "Unsupported WASAPI format: tag %d, %d bits\n", tag, wf->wBitsPerSample);
++    return AVERROR(ENOSYS);
++}
++
++static void fill_waveformat(WAVEFORMATEXTENSIBLE *wfe, int rate, int channels, int use_float)
++{
++    WAVEFORMATEX *wf = &wfe->Format;
++    int bits = use_float ? 32 : 16;
++
++    memset(wfe, 0, sizeof(*wfe));
++
++    wf->wFormatTag      = WAVE_FORMAT_EXTENSIBLE;
++    wf->nChannels       = channels;
++    wf->nSamplesPerSec  = rate;
++    wf->wBitsPerSample  = bits;
++    wf->nBlockAlign     = channels * bits / 8;
++    wf->nAvgBytesPerSec = rate * wf->nBlockAlign;
++    wf->cbSize          = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
++
++    wfe->Samples.wValidBitsPerSample = bits;
++    wfe->dwChannelMask = channels == 1 ? SPEAKER_FRONT_CENTER
++                                       : (SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT);
++    wfe->SubFormat = use_float ? ff_KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
++                               : ff_KSDATAFORMAT_SUBTYPE_PCM;
++}
++
++/* ------------------------------------------------------------------------ */
++/* demuxer                                                                   */
++/* ------------------------------------------------------------------------ */
++
++static int wasapi_read_close(AVFormatContext *avctx);
++
++static int wasapi_read_header(AVFormatContext *avctx)
++{
++    WasapiContext *s = avctx->priv_data;
++    WAVEFORMATEX *mix = NULL;
++    WAVEFORMATEXTENSIBLE forced;
++    const WAVEFORMATEX *wf = NULL;
++    AVStream *st;
++    enum AVCodecID codec_id;
++    uint64_t mask = 0;
++    DWORD flags = 0;
++    REFERENCE_TIME duration;
++    const char *name = avctx->url;
++    EDataFlow flow = eRender;
++    HRESULT hr;
++    int ret, is_loopback, process_mode = 0;
++
++    hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
++    if (hr == RPC_E_CHANGED_MODE) {
++        /* Somebody already initialised COM as STA in this thread; that is fine. */
++        s->com_initialized = 0;
++    } else if (FAILED(hr)) {
++        av_log(avctx, AV_LOG_ERROR, "CoInitializeEx failed: %s\n", hr2str(hr));
++        return AVERROR_EXTERNAL;
++    } else {
++        s->com_initialized = 1;
++    }
++
++    hr = CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL,
++                          &IID_IMMDeviceEnumerator, (void **)&s->enumerator);
++    if (FAILED(hr)) {
++        av_log(avctx, AV_LOG_ERROR, "Could not create device enumerator: %s\n", hr2str(hr));
++        ret = AVERROR_EXTERNAL;
++        goto fail;
++    }
++
++    if (s->list_devices) {
++        ret = do_list_devices(avctx);
++        goto fail;
++    }
++
++    /* "pid=1234" as input name is a shorthand for -pid 1234 */
++    if (name && !av_strncasecmp(name, "pid=", 4)) {
++        s->pid = atoi(name + 4);
++        name = "";
++    }
++
++    if (s->pid > 0)
++        process_mode = 1;
++
++    if (!process_mode) {
++        if (!name || !*name || !av_strcasecmp(name, "default") ||
++            !av_strcasecmp(name, "default_output")) {
++            flow = eRender;
++            hr = IMMDeviceEnumerator_GetDefaultAudioEndpoint(s->enumerator, eRender,
++                                                             eConsole, &s->device);
++        } else if (!av_strcasecmp(name, "default_input")) {
++            flow = eCapture;
++            hr = IMMDeviceEnumerator_GetDefaultAudioEndpoint(s->enumerator, eCapture,
++                                                             eConsole, &s->device);
++        } else {
++            /* Look at render endpoints first, then capture endpoints. */
++            flow = eRender;
++            ret  = find_device(avctx, name, eRender, &s->device);
++            if (ret < 0) {
++                flow = eCapture;
++                ret  = find_device(avctx, name, eCapture, &s->device);
++            }
++            if (ret < 0) {
++                av_log(avctx, AV_LOG_ERROR,
++                       "Could not find audio device \"%s\". "
++                       "Run with -list_devices true to see the available devices.\n", name);
++                goto fail;
++            }
++            hr = S_OK;
++        }
++
++        if (FAILED(hr) || !s->device) {
++            av_log(avctx, AV_LOG_ERROR, "Could not open audio device: %s\n", hr2str(hr));
++            ret = AVERROR(ENODEV);
++            goto fail;
++        }
++
++        {
++            char *fname = device_friendly_name(s->device);
++            av_log(avctx, AV_LOG_INFO, "Using %s device \"%s\"\n",
++                   flow == eRender ? "render" : "capture", fname ? fname : "unknown");
++            av_free(fname);
++        }
++
++        hr = IMMDevice_Activate(s->device, &IID_IAudioClient, CLSCTX_ALL, NULL,
++                                (void **)&s->client);
++        if (FAILED(hr)) {
++            av_log(avctx, AV_LOG_ERROR, "Could not activate audio client: %s\n", hr2str(hr));
++            ret = AVERROR_EXTERNAL;
++            goto fail;
++        }
++    } else {
++        av_log(avctx, AV_LOG_INFO, "Capturing audio of process %d (%s process tree)\n",
++               s->pid, s->exclude_pid ? "excluding" : "including");
++        ret = activate_process_loopback(avctx, &s->client);
++        if (ret < 0)
++            goto fail;
++        flow = eRender;
++    }
++
++    /* loopback: automatic for render endpoints, always on for process capture */
++    is_loopback = process_mode ? 1 :
++                  (s->loopback >= 0 ? s->loopback : (flow == eRender));
++
++    if (is_loopback && s->exclusive) {
++        av_log(avctx, AV_LOG_ERROR,
++               "Loopback capture is not possible in exclusive mode.\n");
++        ret = AVERROR(EINVAL);
++        goto fail;
++    }
++
++    if (process_mode) {
++        /* Process loopback cannot negotiate a mix format, it must be told one. */
++        fill_waveformat(&forced,
++                        s->req_sample_rate > 0 ? s->req_sample_rate : 48000,
++                        s->req_channels    > 0 ? s->req_channels    : 2,
++                        s->req_sample_fmt == 1 ? 0 : 1);
++        wf = &forced.Format;
++    } else if (s->req_sample_rate > 0 || s->req_channels > 0 || s->req_sample_fmt == 1) {
++        hr = IAudioClient_GetMixFormat(s->client, &mix);
++        if (FAILED(hr)) {
++            av_log(avctx, AV_LOG_ERROR, "GetMixFormat failed: %s\n", hr2str(hr));
++            ret = AVERROR_EXTERNAL;
++            goto fail;
++        }
++        fill_waveformat(&forced,
++                        s->req_sample_rate > 0 ? s->req_sample_rate : (int)mix->nSamplesPerSec,
++                        s->req_channels    > 0 ? s->req_channels    : mix->nChannels,
++                        s->req_sample_fmt == 1 ? 0 : 1);
++        wf = &forced.Format;
++    } else {
++        hr = IAudioClient_GetMixFormat(s->client, &mix);
++        if (FAILED(hr)) {
++            av_log(avctx, AV_LOG_ERROR, "GetMixFormat failed: %s\n", hr2str(hr));
++            ret = AVERROR_EXTERNAL;
++            goto fail;
++        }
++        wf = mix;
++    }
++
++    ret = waveformat_to_codec(avctx, wf, &codec_id, &mask);
++    if (ret < 0)
++        goto fail;
++
++    flags = 0;
++    if (is_loopback)
++        flags |= AUDCLNT_STREAMFLAGS_LOOPBACK;
++    if (process_mode || !is_loopback)
++        flags |= AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
++
++    duration = (REFERENCE_TIME)s->buffer_ms * 10000;
++
++    hr = IAudioClient_Initialize(s->client,
++                                 s->exclusive ? AUDCLNT_SHAREMODE_EXCLUSIVE
++                                              : AUDCLNT_SHAREMODE_SHARED,
++                                 flags, duration,
++                                 s->exclusive ? duration : 0, wf, NULL);
++
++    if (hr == AUDCLNT_E_UNSUPPORTED_FORMAT && process_mode && s->req_sample_fmt != 1) {
++        av_log(avctx, AV_LOG_WARNING,
++               "Float capture rejected for process loopback, retrying with 16 bit PCM\n");
++        fill_waveformat(&forced,
++                        s->req_sample_rate > 0 ? s->req_sample_rate : 48000,
++                        s->req_channels    > 0 ? s->req_channels    : 2, 0);
++        wf  = &forced.Format;
++        ret = waveformat_to_codec(avctx, wf, &codec_id, &mask);
++        if (ret < 0)
++            goto fail;
++        hr = IAudioClient_Initialize(s->client, AUDCLNT_SHAREMODE_SHARED, flags,
++                                     duration, 0, wf, NULL);
++    }
++
++    if (FAILED(hr)) {
++        av_log(avctx, AV_LOG_ERROR, "IAudioClient::Initialize failed: %s (0x%08lX)\n",
++               hr2str(hr), (unsigned long)hr);
++        ret = AVERROR_EXTERNAL;
++        goto fail;
++    }
++
++    if (flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK) {
++        s->event = CreateEventW(NULL, FALSE, FALSE, NULL);
++        if (!s->event) {
++            ret = AVERROR(ENOMEM);
++            goto fail;
++        }
++        hr = IAudioClient_SetEventHandle(s->client, s->event);
++        if (FAILED(hr)) {
++            av_log(avctx, AV_LOG_ERROR, "SetEventHandle failed: %s\n", hr2str(hr));
++            ret = AVERROR_EXTERNAL;
++            goto fail;
++        }
++    }
++
++    hr = IAudioClient_GetService(s->client, &IID_IAudioCaptureClient, (void **)&s->capture);
++    if (FAILED(hr)) {
++        av_log(avctx, AV_LOG_ERROR, "Could not get capture service: %s\n", hr2str(hr));
++        ret = AVERROR_EXTERNAL;
++        goto fail;
++    }
++
++    s->sample_rate = wf->nSamplesPerSec;
++    s->channels    = wf->nChannels;
++    s->frame_size  = wf->nBlockAlign;
++
++    st = avformat_new_stream(avctx, NULL);
++    if (!st) {
++        ret = AVERROR(ENOMEM);
++        goto fail;
++    }
++
++    st->codecpar->codec_type            = AVMEDIA_TYPE_AUDIO;
++    st->codecpar->codec_id              = codec_id;
++    st->codecpar->sample_rate           = s->sample_rate;
++    st->codecpar->bits_per_coded_sample = wf->wBitsPerSample;
++    st->codecpar->block_align           = wf->nBlockAlign;
++    st->codecpar->bit_rate              = (int64_t)wf->nAvgBytesPerSec * 8;
++
++    if (mask)
++        av_channel_layout_from_mask(&st->codecpar->ch_layout, mask);
++    if (st->codecpar->ch_layout.nb_channels != s->channels) {
++        av_channel_layout_uninit(&st->codecpar->ch_layout);
++        av_channel_layout_default(&st->codecpar->ch_layout, s->channels);
++    }
++
++    avpriv_set_pts_info(st, 64, 1, s->sample_rate);
++
++    hr = IAudioClient_Start(s->client);
++    if (FAILED(hr)) {
++        av_log(avctx, AV_LOG_ERROR, "Could not start capture: %s\n", hr2str(hr));
++        ret = AVERROR_EXTERNAL;
++        goto fail;
++    }
++
++    s->started    = 1;
++    s->start_time = av_gettime_relative();
++    s->next_pts   = 0;
++
++    av_log(avctx, AV_LOG_INFO,
++           "Capturing %d Hz, %d channels, %s%s\n",
++           s->sample_rate, s->channels, avcodec_get_name(codec_id),
++           is_loopback ? ", loopback" : "");
++
++    if (mix)
++        CoTaskMemFree(mix);
++
++    return 0;
++
++fail:
++    if (mix)
++        CoTaskMemFree(mix);
++    /* keep the AVERROR_EXIT of -list_devices intact */
++    if (ret == 0)
++        ret = AVERROR_EXTERNAL;
++    wasapi_read_close(avctx);
++    return ret;
++}
++
++/* Produce a packet of digital silence covering the gap up to "now". */
++static int produce_silence(AVFormatContext *avctx, AVPacket *pkt, int64_t nb_samples)
++{
++    WasapiContext *s = avctx->priv_data;
++    int ret;
++
++    nb_samples = FFMIN(nb_samples, s->sample_rate / 10); /* at most 100 ms per packet */
++    if (nb_samples <= 0)
++        return AVERROR(EAGAIN);
++
++    ret = av_new_packet(pkt, nb_samples * s->frame_size);
++    if (ret < 0)
++        return ret;
++
++    memset(pkt->data, 0, pkt->size);
++    pkt->pts      = s->next_pts;
++    pkt->dts      = s->next_pts;
++    pkt->duration = nb_samples;
++    pkt->stream_index = 0;
++    s->next_pts  += nb_samples;
++
++    return 0;
++}
++
++static int wasapi_read_packet(AVFormatContext *avctx, AVPacket *pkt)
++{
++    WasapiContext *s = avctx->priv_data;
++    HRESULT hr;
++
++    for (;;) {
++        UINT32 nb_frames = 0;
++        BYTE *data = NULL;
++        DWORD bflags = 0;
++        int ret;
++
++        if (avctx->interrupt_callback.callback &&
++            avctx->interrupt_callback.callback(avctx->interrupt_callback.opaque))
++            return AVERROR_EXIT;
++
++        hr = IAudioCaptureClient_GetNextPacketSize(s->capture, &nb_frames);
++        if (hr == AUDCLNT_E_DEVICE_INVALIDATED) {
++            av_log(avctx, AV_LOG_ERROR, "Audio device was removed or reconfigured\n");
++            return AVERROR_EOF;
++        }
++        if (FAILED(hr)) {
++            av_log(avctx, AV_LOG_ERROR, "GetNextPacketSize failed: %s\n", hr2str(hr));
++            return AVERROR_EXTERNAL;
++        }
++
++        if (nb_frames) {
++            hr = IAudioCaptureClient_GetBuffer(s->capture, &data, &nb_frames, &bflags, NULL, NULL);
++            if (hr == AUDCLNT_S_BUFFER_EMPTY)
++                continue;
++            if (FAILED(hr)) {
++                av_log(avctx, AV_LOG_ERROR, "GetBuffer failed: %s\n", hr2str(hr));
++                return AVERROR_EXTERNAL;
++            }
++
++            if (bflags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY)
++                av_log(avctx, AV_LOG_WARNING, "Audio capture glitch detected\n");
++
++            ret = av_new_packet(pkt, nb_frames * s->frame_size);
++            if (ret < 0) {
++                IAudioCaptureClient_ReleaseBuffer(s->capture, nb_frames);
++                return ret;
++            }
++
++            if (bflags & AUDCLNT_BUFFERFLAGS_SILENT)
++                memset(pkt->data, 0, pkt->size);
++            else
++                memcpy(pkt->data, data, pkt->size);
++
++            IAudioCaptureClient_ReleaseBuffer(s->capture, nb_frames);
++
++            pkt->pts          = s->next_pts;
++            pkt->dts          = s->next_pts;
++            pkt->duration     = nb_frames;
++            pkt->stream_index = 0;
++            s->next_pts      += nb_frames;
++
++            return 0;
++        }
++
++        /* No data available. A loopback stream produces nothing at all while the
++         * endpoint is idle, so synthesise silence to keep the timeline honest. */
++        if (s->fill_silence) {
++            int64_t now      = av_gettime_relative() - s->start_time;
++            int64_t expected = av_rescale(now, s->sample_rate, AV_TIME_BASE);
++            int64_t behind   = expected - s->next_pts;
++            int64_t trigger  = av_rescale(s->silence_ms, s->sample_rate, 1000);
++
++            if (behind > trigger)
++                return produce_silence(avctx, pkt, behind - trigger / 2);
++        }
++
++        if (s->event) {
++            if (WaitForSingleObject(s->event, 100) == WAIT_FAILED)
++                return AVERROR_EXTERNAL;
++        } else {
++            av_usleep(5000);
++        }
++    }
++}
++
++static int wasapi_read_close(AVFormatContext *avctx)
++{
++    WasapiContext *s = avctx->priv_data;
++
++    if (s->client && s->started)
++        IAudioClient_Stop(s->client);
++    s->started = 0;
++
++    if (s->capture) {
++        IAudioCaptureClient_Release(s->capture);
++        s->capture = NULL;
++    }
++    if (s->client) {
++        IAudioClient_Release(s->client);
++        s->client = NULL;
++    }
++    if (s->device) {
++        IMMDevice_Release(s->device);
++        s->device = NULL;
++    }
++    if (s->enumerator) {
++        IMMDeviceEnumerator_Release(s->enumerator);
++        s->enumerator = NULL;
++    }
++    if (s->event) {
++        CloseHandle(s->event);
++        s->event = NULL;
++    }
++    if (s->mmdevapi) {
++        FreeLibrary(s->mmdevapi);
++        s->mmdevapi = NULL;
++    }
++    if (s->com_initialized) {
++        CoUninitialize();
++        s->com_initialized = 0;
++    }
++
++    return 0;
++}
++
++#define OFFSET(x) offsetof(WasapiContext, x)
++#define DEC AV_OPT_FLAG_DECODING_PARAM
++
++static const AVOption options[] = {
++    { "list_devices", "list available audio devices and exit",
++        OFFSET(list_devices), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, DEC },
++    { "loopback", "capture what a device plays back (-1 = automatic)",
++        OFFSET(loopback), AV_OPT_TYPE_BOOL, { .i64 = -1 }, -1, 1, DEC },
++    { "exclusive", "open the endpoint in exclusive mode",
++        OFFSET(exclusive), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, DEC },
++    { "audio_buffer_size", "buffer size in milliseconds",
++        OFFSET(buffer_ms), AV_OPT_TYPE_INT, { .i64 = 500 }, 10, 10000, DEC },
++    { "pid", "capture only the audio of this process id (0 = whole device)",
++        OFFSET(pid), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, DEC },
++    { "exclude_pid", "capture everything except the given process id",
++        OFFSET(exclude_pid), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, DEC },
++    { "fill_silence", "insert silence while the endpoint is idle",
++        OFFSET(fill_silence), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, DEC },
++    { "silence_threshold", "idle time in milliseconds before silence is inserted",
++        OFFSET(silence_ms), AV_OPT_TYPE_INT, { .i64 = 100 }, 10, 10000, DEC },
++    { "sample_rate", "force a sample rate",
++        OFFSET(req_sample_rate), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, DEC },
++    { "channels", "force a channel count",
++        OFFSET(req_channels), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 64, DEC },
++    { "format", "sample format to request", OFFSET(req_sample_fmt),
++        AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 1, DEC, .unit = "format" },
++    { "float", "32 bit float", 0, AV_OPT_TYPE_CONST, { .i64 = 0 }, 0, 0, DEC, .unit = "format" },
++    { "s16",   "16 bit signed", 0, AV_OPT_TYPE_CONST, { .i64 = 1 }, 0, 0, DEC, .unit = "format" },
++    { NULL },
++};
++
++static const AVClass wasapi_class = {
++    .class_name = "wasapi indev",
++    .option     = options,
++    .version    = LIBAVUTIL_VERSION_INT,
++    .category   = AV_CLASS_CATEGORY_DEVICE_AUDIO_INPUT,
++};
++
++const FFInputFormat ff_wasapi_demuxer = {
++    .p.name         = "wasapi",
++    .p.long_name    = NULL_IF_CONFIG_SMALL("WASAPI audio capture"),
++    .p.flags        = AVFMT_NOFILE,
++    .p.priv_class   = &wasapi_class,
++    .priv_data_size = sizeof(WasapiContext),
++    .read_header    = wasapi_read_header,
++    .read_packet    = wasapi_read_packet,
++    .read_close     = wasapi_read_close,
++};
+-- 
+2.39.5
+

@@ -2,6 +2,25 @@
 set -xe
 shopt -s globstar
 cd "$(dirname "$0")"
+
+# --- Git Bash / MSYS host compatibility -------------------------------------
+# MSYS rewrites lone POSIX paths (e.g. the "/build.sh" argument) into Windows
+# paths before handing them to native binaries such as docker.exe, which turns
+# every container-side path into garbage like "C:/Program Files/Git/build.sh".
+case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) IS_MSYS=1 ;;
+    *)                    IS_MSYS=0 ;;
+esac
+
+if [[ $IS_MSYS == 1 ]]; then
+    export MSYS_NO_PATHCONV=1
+    export MSYS2_ARG_CONV_EXCL='*'
+fi
+
+# Multi-GB build trees must not go through a recycle-bin/trash wrapper: it is
+# slow, fills the bin, and fails outright on container-created files.
+if [[ -x /usr/bin/rm ]]; then RM=/usr/bin/rm; else RM=rm; fi
+
 source util/vars.sh
 
 source "variants/${TARGET}-${VARIANT}.sh"
@@ -10,13 +29,18 @@ for addin in ${ADDINS[*]}; do
     source "addins/${addin}.sh"
 done
 
-if docker info -f "{{println .SecurityOptions}}" | grep rootless >/dev/null 2>&1; then
+if [[ $IS_MSYS == 1 ]]; then
+    # id -u on Git Bash returns the Windows RID (e.g. 197609). Passing it to
+    # the container would run as a user that does not exist inside the image;
+    # Docker Desktop handles bind mount ownership on its own anyway.
+    UIDARGS=()
+elif docker info -f "{{println .SecurityOptions}}" | grep rootless >/dev/null 2>&1; then
     UIDARGS=()
 else
     UIDARGS=( -u "$(id -u):$(id -g)" )
 fi
 
-rm -rf ffbuild
+"$RM" -rf ffbuild
 mkdir ffbuild
 
 FFMPEG_REPO="${FFMPEG_REPO:-https://github.com/FFmpeg/FFmpeg.git}"
@@ -24,41 +48,100 @@ FFMPEG_REPO="${FFMPEG_REPO_OVERRIDE:-$FFMPEG_REPO}"
 GIT_BRANCH="${GIT_BRANCH:-master}"
 GIT_BRANCH="${GIT_BRANCH_OVERRIDE:-$GIT_BRANCH}"
 
-BUILD_SCRIPT="$(mktemp)"
-trap "rm -f -- '$BUILD_SCRIPT'" EXIT
+# Mirrors that do not implement partial clone silently fall back to a full
+# history download; FFMPEG_CLONE_ARGS="--depth=1" is the fast way out.
+CLONE_ARGS="${FFMPEG_CLONE_ARGS:---filter=blob:none}"
+
+# Where the compile actually happens inside the container. On Docker Desktop
+# the /ffbuild bind mount is a Windows drive share and far too slow to compile
+# on, so use the container filesystem and copy the results out at the end.
+if [[ $IS_MSYS == 1 ]]; then
+    WORKDIR_CT="/ffwork"
+else
+    WORKDIR_CT="/ffbuild"
+fi
+
+if [[ $IS_MSYS == 1 ]]; then
+    # MSYS /tmp lives in the Windows temp dir, which the Linux docker daemon
+    # cannot resolve. Put the script inside ffbuild, which is mounted already.
+    BUILD_SCRIPT="$PWD/ffbuild/docker-build.sh"
+    BUILD_SCRIPT_CT="/ffbuild/docker-build.sh"
+    BUILD_SCRIPT_MOUNT=()
+else
+    BUILD_SCRIPT="$(mktemp)"
+    BUILD_SCRIPT_CT="/build.sh"
+    BUILD_SCRIPT_MOUNT=( -v "$BUILD_SCRIPT":/build.sh )
+    trap "$RM -f -- '$BUILD_SCRIPT'" EXIT
+fi
 
 cat <<EOF >"$BUILD_SCRIPT"
     set -xe
-    cd /ffbuild
-    rm -rf ffmpeg prefix
+    WORK="$WORKDIR_CT"
+    rm -rf "\$WORK"
+    mkdir -p "\$WORK"
+    cd "\$WORK"
 
-    git clone --filter=blob:none --branch='$GIT_BRANCH' '$FFMPEG_REPO' ffmpeg
+    git clone $CLONE_ARGS --branch='$GIT_BRANCH' '$FFMPEG_REPO' ffmpeg
     cd ffmpeg
 
-    ./configure --prefix=/ffbuild/prefix --pkg-config-flags="--static" \$FFBUILD_TARGET_FLAGS \$FF_CONFIGURE \
+    if [[ -f /ffmods/apply-wasapi.sh ]]; then
+        bash /ffmods/apply-wasapi.sh "\$WORK/ffmpeg" /ffmods/wasapi_dec.c
+    fi
+
+    for p in /ffmods/*.patch; do
+        [[ -f "\$p" ]] || continue
+        echo "Applying \$p"
+        git apply "\$p"
+    done
+
+    ./configure --prefix="\$WORK/prefix" --pkg-config-flags="--static" \$FFBUILD_TARGET_FLAGS \$FF_CONFIGURE \
         --extra-cflags="\$FF_CFLAGS" --extra-cxxflags="\$FF_CXXFLAGS" --extra-libs="\$FF_LIBS" \
         --extra-ldflags="\$FF_LDFLAGS" --extra-ldexeflags="\$FF_LDEXEFLAGS" \
         --cc="\$CC" --cxx="\$CXX" --ar="\$AR" --ranlib="\$RANLIB" --nm="\$NM" \
         --extra-version="\$(date +%Y%m%d)" || { cat ffbuild/config.log; exit 1; }
     make -j\$(nproc) V=1
     make install install-doc
+
+    # When building outside the bind mount (Docker Desktop bind mounts are ~70x
+    # slower for small files), publish only what packaging needs, in one pass.
+    if [[ "\$WORK" != "/ffbuild" ]]; then
+        rm -rf /ffbuild/prefix /ffbuild/ffmpeg
+        mkdir -p /ffbuild/prefix /ffbuild/ffmpeg
+        cp -a "\$WORK"/prefix/bin /ffbuild/prefix/
+        cp -a "\$WORK"/prefix/share /ffbuild/prefix/
+        "\$WORK"/ffmpeg/ffbuild/version.sh "\$WORK"/ffmpeg > /ffbuild/BUILD_VERSION
+        for f in COPYING.GPLv3 COPYING.GPLv2 COPYING.LGPLv3 COPYING.LGPLv2.1; do
+            if [[ -f "\$WORK/ffmpeg/\$f" ]]; then cp "\$WORK/ffmpeg/\$f" /ffbuild/ffmpeg/; fi
+        done
+    fi
 EOF
 
 [[ -t 1 ]] && TTY_ARG="-t" || TTY_ARG=""
 
-docker run --rm -i $TTY_ARG "${UIDARGS[@]}" -v "$PWD/ffbuild":/ffbuild -v "$BUILD_SCRIPT":/build.sh "$IMAGE" bash /build.sh
+# Local FFmpeg modifications (out of tree devices, patches) live in ./wasapi
+FFMODS_ARGS=()
+[[ -d "$PWD/wasapi" ]] && FFMODS_ARGS=( -v "$PWD/wasapi":/ffmods )
+
+docker run --rm -i $TTY_ARG "${UIDARGS[@]}" -v "$PWD/ffbuild":/ffbuild "${FFMODS_ARGS[@]}" "${BUILD_SCRIPT_MOUNT[@]}" "$IMAGE" bash "$BUILD_SCRIPT_CT"
 
 if [[ -n "$FFBUILD_OUTPUT_DIR" ]]; then
     mkdir -p "$FFBUILD_OUTPUT_DIR"
     package_variant ffbuild/prefix "$FFBUILD_OUTPUT_DIR"
     [[ -n "$LICENSE_FILE" ]] && cp "ffbuild/ffmpeg/$LICENSE_FILE" "$FFBUILD_OUTPUT_DIR/LICENSE.txt"
-    rm -rf ffbuild
+    "$RM" -rf ffbuild
     exit 0
 fi
 
 mkdir -p artifacts
 ARTIFACTS_PATH="$PWD/artifacts"
-BUILD_NAME="ffmpeg-$(./ffbuild/ffmpeg/ffbuild/version.sh ffbuild/ffmpeg)-${TARGET}-${VARIANT}${ADDINS_STR:+-}${ADDINS_STR}"
+# version.sh needs the git tree, which stays inside the container when the
+# build ran outside the bind mount; the container writes BUILD_VERSION instead.
+if [[ -f ffbuild/BUILD_VERSION ]]; then
+    FF_VERSION="$(cat ffbuild/BUILD_VERSION)"
+else
+    FF_VERSION="$(./ffbuild/ffmpeg/ffbuild/version.sh ffbuild/ffmpeg)"
+fi
+BUILD_NAME="ffmpeg-${FF_VERSION}-${TARGET}-${VARIANT}${ADDINS_STR:+-}${ADDINS_STR}"
 
 mkdir -p "ffbuild/pkgroot/$BUILD_NAME"
 package_variant ffbuild/prefix "ffbuild/pkgroot/$BUILD_NAME"
@@ -75,7 +158,7 @@ else
 fi
 cd -
 
-rm -rf ffbuild
+"$RM" -rf ffbuild
 
 if [[ -n "$GITHUB_ACTIONS" ]]; then
     echo "build_name=${BUILD_NAME}" >> "$GITHUB_OUTPUT"

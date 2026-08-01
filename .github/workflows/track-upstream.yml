@@ -1,0 +1,50 @@
+name: Track BtbN upstream
+
+# This is the ONLY timer in the project, and it is intrinsic to "method B":
+# GitHub Actions cannot be event-driven on a repo you do not own (BtbN), so we
+# poll its HEAD commit every 6h. The poll does NOT build anything -- it only
+# compares the upstream SHA against the last seen value stored in
+# .github/upstream-sha.txt. The real build (build.yml) is triggered ONLY when
+# the upstream actually advanced. No upstream change => zero build minutes.
+on:
+  schedule:
+    - cron: "37 */6 * * *"   # off-peak-ish, every 6 hours
+  workflow_dispatch:
+
+permissions:
+  contents: write   # to commit the new SHA back
+  actions: write    # to dispatch the build workflow
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Fetch upstream HEAD SHA
+        id: upstream
+        run: |
+          SHA=$(curl -fsSL "https://api.github.com/repos/BtbN/FFmpeg-Builds/commits?per_page=1" | python3 -c "import sys,json;print(json.load(sys.stdin)[0][\"sha\"])")
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          STORED=$(cat .github/upstream-sha.txt 2>/dev/null | tr -d "[:space:]")
+          echo "stored=$STORED"
+          if [ "$SHA" != "$STORED" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Record new SHA and trigger build
+        if: ${{ steps.upstream.outputs.changed }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "${{ steps.upstream.outputs.sha }}" > .github/upstream-sha.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .github/upstream-sha.txt
+          git commit -m "chore: BtbN upstream advanced to ${{ steps.upstream.outputs.sha }}"
+          git push
+          gh workflow run build.yml -f doRelease=true
