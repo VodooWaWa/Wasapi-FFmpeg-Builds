@@ -77,7 +77,14 @@ fi
 cat <<EOF >"$BUILD_SCRIPT"
     set -xe
     WORK="$WORKDIR_CT"
-    rm -rf "\$WORK"
+    # Clear the bind-mount contents WITHOUT removing the mountpoint itself.
+    # On rootful GitHub-hosted runners the container runs as a non-root uid
+    # (-u $(id -u):$(id -g)), and "rm -rf /ffbuild" would try to rmdir the
+    # mountpoint, which needs write permission on "/" and fails with
+    # "Permission denied". Removing only the contents keeps ownership on the
+    # host consistent so the later host-side cleanup works too.
+    mkdir -p "\$WORK"
+    find "\$WORK" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
     mkdir -p "\$WORK"
     cd "\$WORK"
 
