@@ -195,6 +195,9 @@ ffmpeg -f gdigrab -framerate 30 -i desktop ^
 
 > 若机器是老驱动（如 472 / 512 系列，仍 ≥ R535），钉 12.2 后 NVENC 依旧可用；只有比 R535 更老的驱动才会回退到 CPU 编码或报错。
 
+- **如何一眼确认本包编译用的是哪个 SDK**：运行 `ffmpeg -version`，版本串里带 `-nvh<SDK>-<commit>` 后缀即编译时锁定的 nv-codec-headers 版本。例如 `-nvh12.2-f8339c0` 表示编译用的是 **sdk/12.2（commit f8339c0）**。
+  - ⚠️ 注意：`ffmpeg -hide_banner -v verbose ... 2>&1 | findstr "Loaded Nvenc version"` 打印的 **`13.1` 之类是「驱动支持的 NVENC 版本上限」，由本机驱动决定，与编译用的 SDK 无关**——在这台机器上无论编译用 12.2 还是 13.x 都会显示同样的值，不能用它判断 pin 是否生效。真正能区分的是**老驱动（< R610）机器上的 NVENC 初始化成败**：12.2 编译的二进制在该机器上能开 NVENC，13.x 编译的会报 `Driver does not support the required nvenc API version 13.x`。
+
 ---
 
 ## 本地构建（高级 / 可选）

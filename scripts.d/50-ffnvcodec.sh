@@ -31,13 +31,21 @@ ffbuild_dockerdl() {
 ffbuild_dockerbuild() {
     # 现代 FFmpeg（含 99999999 哨兵 / 8.0+）一律用 sdk/12.2；
     # 只有古老版本（ffver < 800，即 4.x–7.x）才回退 sdk/11.1。
+    local SDK_VER
     if (( $FFVER < 800 )); then
         cd ffnvcodec3
+        SDK_VER="${SCRIPT_BRANCH3#sdk/}-${SCRIPT_COMMIT3:0:7}"
     else
         cd ffnvcodec
+        SDK_VER="${SCRIPT_BRANCH#sdk/}-${SCRIPT_COMMIT:0:7}"
     fi
 
     make PREFIX="$FFBUILD_PREFIX" DESTDIR="$FFBUILD_DESTDIR" install
+
+    # 自检标记：把本次实际安装的 nv-codec-headers SDK 版本+commit 写出，
+    # 供 build.sh 注入 ffmpeg --extra-version，使 `ffmpeg -version` 一目了然：
+    # 编译用的是 sdk/12.2 还是 13.x，不用再靠 `Loaded Nvenc version`（那是驱动）去猜。
+    echo "$SDK_VER" > /nv-codec-headers.version
 }
 
 ffbuild_configure() {
