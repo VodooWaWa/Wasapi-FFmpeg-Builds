@@ -101,10 +101,24 @@ cat <<EOF >"$BUILD_SCRIPT"
         git apply "\$p"
     done
 
+    # --- Pin nv-codec-headers to sdk/12.2 (override BtbN base image's 13.1) ---
+    # NOTE: this fork's scripts.d/50-ffnvcodec.sh is NOT invoked by build.sh; it
+    # only runs during BtbN base-image builds, which our CI does not perform. The
+    # nv-codec-headers ffmpeg compiles against therefore comes from the BtbN base
+    # image (NVENC API 13.1, needs driver >= R610). To actually pin 12.2 we must
+    # install it HERE, in the live build container, before ./configure.
+    rm -rf /nvh_src
+    git clone https://github.com/FFmpeg/nv-codec-headers.git /nvh_src
+    git -C /nvh_src checkout -q f8339c06648fb6642aac1261d76e4158dc0b5401
+    make -C /nvh_src install PREFIX=/nvh12 >/dev/null 2>&1
+    echo "12.2-f8339c0" > /nv-codec-headers.version
+    export PKG_CONFIG_PATH=/nvh12/lib/pkgconfig:\$PKG_CONFIG_PATH
+    NVH_CFLAGS=-I/nvh12/include
+
     NVH_VER=""
     [[ -f /nv-codec-headers.version ]] && NVH_VER="\$(cat /nv-codec-headers.version)"
     ./configure --prefix="\$WORK/prefix" --pkg-config-flags="--static" \$FFBUILD_TARGET_FLAGS \$FF_CONFIGURE \
-        --extra-cflags="\$FF_CFLAGS" --extra-cxxflags="\$FF_CXXFLAGS" --extra-libs="\$FF_LIBS" \
+        --extra-cflags="\$NVH_CFLAGS \$FF_CFLAGS" --extra-cxxflags="\$FF_CXXFLAGS" --extra-libs="\$FF_LIBS" \
         --extra-ldflags="\$FF_LDFLAGS" --extra-ldexeflags="\$FF_LDEXEFLAGS" \
         --cc="\$CC" --cxx="\$CXX" --ar="\$AR" --ranlib="\$RANLIB" --nm="\$NM" \
         --extra-version="\$(date +%Y%m%d)\${NVH_VER:+-nvh\$NVH_VER}" || { cat ffbuild/config.log; exit 1; }

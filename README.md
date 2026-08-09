@@ -187,10 +187,12 @@ ffmpeg -f gdigrab -framerate 30 -i desktop ^
 
 ## GPU 硬件编码（NVENC）驱动兼容性
 
-本仓库预编译的 ffmpeg 把 `nv-codec-headers` **钉在 `sdk/12.2`**（CUDA 12.2 头文件，commit `f8339c0`）。
+本仓库预编译的 ffmpeg 现在把 `nv-codec-headers` **钉在 `sdk/12.2`**（CUDA 12.2 头文件，commit `f8339c0`）。
+
+> **实现位置（重要）**：钉版**不是在 `scripts.d/50-ffnvcodec.sh` 里做的**——那个文件在本 fork 的 `build.sh` 流程中**不会被调用**（它只服务于 BtbN 的基础镜像构建，而本 CI 直接 `pull` BtbN 现成基础镜像 `ghcr.io/btbn/ffmpeg-builds/win64-gpl:latest`）。BtbN 基础镜像自带的是 **NVENC API 13.1**（要求驱动 ≥ R610）。真正的钉版是在 `build.sh` 写入容器的构建脚本里，于 `./configure` **之前**把 sdk/12.2 `git clone` + `make install` 装进容器、覆盖基础镜像的 13.1 头文件，并写 `/nv-codec-headers.version` 标记。
 
 - **兼容性面**：ffmpeg 的 NVENC 编码能力下限对应 **API 12.2**，即 **NVIDIA 驱动 ≥ R535（Windows 536.25+ / Linux 535.86.05+）即可用**，不需要升级到 13.x 要求的 R610。
-- **为什么钉 12.2**：上游默认已追到 `sdk/13.0`，要求驱动 ≥ R610；任何驱动低于 610 的机器（老显卡 / 长期未更新的机器）`h264_nvenc` / `hevc_nvenc` 会直接不可用。钉到 12.2 把兼容面铺到绝大多数在役驱动，对 H.264 / HEVC 录制**无任何功能损失**——本仓库不使用 13.x 的新特性（新 codec、新 rate-control 等），因此不损失任何我们需要的能力。
+- **为什么钉 12.2**：BtbN 基础镜像默认已追到 **API 13.1**，要求驱动 ≥ R610；任何驱动低于 610 的机器（老显卡 / 长期未更新的机器）`h264_nvenc` / `hevc_nvenc` 会直接不可用。钉到 12.2 把兼容面铺到绝大多数在役驱动，对 H.264 / HEVC 录制**无任何功能损失**——本仓库不使用 13.x 的新特性，因此不损失任何我们需要的能力。
 - **影响范围**：只影响用 `-c:v h264_nvenc` / `hevc_nvenc`（及基于 NVENC 的编码器）录制 / 转码。CPU 编码（`libx264` 等）、`d3d11va` / `dxva2` 等解码不受影响。
 
 > 若机器是老驱动（如 472 / 512 系列，仍 ≥ R535），钉 12.2 后 NVENC 依旧可用；只有比 R535 更老的驱动才会回退到 CPU 编码或报错。
