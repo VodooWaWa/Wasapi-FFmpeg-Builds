@@ -41,8 +41,8 @@ BtbN 推送新 commit
 两种途径，都是 CI 产物，**无需本地构建**：
 
 - **GitHub Releases（推荐）**：每次成功构建自动创建一个 Release（tag 形如 `wasapi-<run_number>`），内含：
-  - `ffmpeg-<ver>-win64-gpl-wasapi.zip` —— x64
-  - `ffmpeg-<ver>-winarm64-gpl-wasapi.zip` —— ARM64
+  - `ffmpeg-N-<commit>-win64-gpl.zip` —— x64
+  - `ffmpeg-N-<commit>-winarm64-gpl.zip` —— ARM64
   直接下载解压即可用，含 `ffmpeg.exe` / `ffprobe.exe`。
 - **Workflow Artifacts**：单次运行（Actions → 某次 run → Artifacts）里也能单独拿到某架构的 zip。
 
