@@ -46,9 +46,12 @@ jobs:
       - name: Build ${{ matrix.target }}-gpl with the WASAPI input device
         run: |
           bash ./build.sh ${{ matrix.target }} gpl > build.log 2>&1; rc=$?
-          tail -n 250 build.log
           if [ "$rc" -ne 0 ]; then
             echo "::error::build failed (rc=$rc)"
+            echo "===== FIRST ERROR LINES IN build.log ====="
+            grep -n -E "error:|Error |No such|fatal:|make\[|Cannot|undefined reference|nvh|ffnvcodec|Loaded Nvenc" build.log | head -50
+            echo "===== TAIL OF build.log ====="
+            tail -n 80 build.log
             exit "$rc"
           fi
 

@@ -105,13 +105,15 @@ cat <<EOF >"$BUILD_SCRIPT"
     # this fork's scripts.d/50-ffnvcodec.sh is NOT invoked by build.sh (it only
     # runs during BtbN base-image builds, which our CI does not perform), so the
     # nv-codec-headers ffmpeg compiles against comes from the BtbN base image
-    # (NVENC API 13.1, needs driver >= R610). To actually pin 12.2 we pre-clone
-    # it on the HOST (build.sh, which has network) and bind-mount it in as
-    # /nvh_src; here we only install it before ./configure. No in-container
-    # network/git required (the build container has no outbound access).
-    NVH_COMMIT="\$(git -C /nvh_src rev-parse --short HEAD 2>/dev/null || echo f8339c0)"
-    make -C /nvh_src install PREFIX=/nvh12 >/dev/null 2>&1
-    echo "12.2-\${NVH_COMMIT}" > /nv-codec-headers.version
+    # (NVENC API 13.1, needs driver >= R610). To actually pin 12.2 we vendor the
+    # sdk/12.2 source in ./nvh-sdk12.2 (no network needed in CI), bind-mount it in
+    # as /nvh_src, copy to a container-local dir and install it before ./configure.
+    # We copy first so the 'make' step does not write ffnvcodec.pc back into the
+    # bind-mounted repo directory.
+    rm -rf /nvh_build
+    cp -a /nvh_src /nvh_build
+    make -C /nvh_build install PREFIX=/nvh12
+    echo "12.2-f8339c0" > /nv-codec-headers.version
     export PKG_CONFIG_PATH=/nvh12/lib/pkgconfig:\$PKG_CONFIG_PATH
     NVH_CFLAGS=-I/nvh12/include
 
@@ -145,16 +147,11 @@ EOF
 FFMODS_ARGS=()
 [[ -d "$PWD/wasapi" ]] && FFMODS_ARGS=( -v "$PWD/wasapi":/ffmods )
 
-# Host-side pre-clone of nv-codec-headers (sdk/12.2) so the build container does
-# NOT need outbound network. Mirrored into the container as /nvh_src (see below),
-# where the docker-build.sh heredoc installs it before ./configure. The base
-# image ships 13.1 (needs driver >= R610); this pins 12.2 (driver >= R535).
-NVH_SRC_DIR="$PWD/nvh_src"
-if [[ ! -d "$NVH_SRC_DIR/.git" ]]; then
-    "$RM" -rf "$NVH_SRC_DIR"
-    git clone --depth 1 --branch sdk/12.2 https://github.com/FFmpeg/nv-codec-headers.git "$NVH_SRC_DIR" \
-        || { echo "::error::failed to pre-clone nv-codec-headers sdk/12.2 on host"; exit 1; }
-fi
+# nv-codec-headers sdk/12.2 is vendored in ./nvh-sdk12.2 (no network needed in CI).
+# Bind-mount it into the container as /nvh_src; docker-build.sh copies it to a
+# container-local dir and installs it before ./configure. The base image ships
+# 13.1 (needs driver >= R610); this pins 12.2 (driver >= R535).
+NVH_SRC_DIR="$PWD/nvh-sdk12.2"
 NVH_MOUNT_ARGS=( -v "$NVH_SRC_DIR":/nvh_src )
 
 docker run --rm -i $TTY_ARG "${UIDARGS[@]}" -v "$PWD/ffbuild":/ffbuild "${FFMODS_ARGS[@]}" "${NVH_MOUNT_ARGS[@]}" "${BUILD_SCRIPT_MOUNT[@]}" "$IMAGE" bash "$BUILD_SCRIPT_CT"
