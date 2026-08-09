@@ -107,18 +107,17 @@ cat <<EOF >"$BUILD_SCRIPT"
     # nv-codec-headers ffmpeg compiles against comes from the BtbN base image
     # (NVENC API 13.1, needs driver >= R610). To actually pin 12.2 we vendor the
     # sdk/12.2 source in ./nvh-sdk12.2 (no network needed in CI), bind-mount it in
-    # as /nvh_src, copy to a container-local dir and install it before ./configure.
-    # We copy first so the 'make' step does not write ffnvcodec.pc back into the
-    # bind-mounted repo directory.
-    rm -rf /nvh_build
-    cp -a /nvh_src /nvh_build
-    make -C /nvh_build install PREFIX=/nvh12
-    echo "12.2-f8339c0" > /nv-codec-headers.version
-    export PKG_CONFIG_PATH=/nvh12/lib/pkgconfig:\$PKG_CONFIG_PATH
-    NVH_CFLAGS=-I/nvh12/include
-
-    NVH_VER=""
-    [[ -f /nv-codec-headers.version ]] && NVH_VER="\$(cat /nv-codec-headers.version)"
+    # as /nvh_src, copy to a writable dir under \$WORK and install it before
+    # ./configure. We copy first so the 'make' step does not write ffnvcodec.pc
+    # back into the read-only bind-mounted repo directory, and we install under
+    # \$WORK (the bind mount / container workdir) because the container runs as a
+    # non-root uid that cannot write to "/" (would fail with "Permission denied").
+    rm -rf "\$WORK/nvh_build" "\$WORK/nvh12"
+    cp -a /nvh_src "\$WORK/nvh_build"
+    make -C "\$WORK/nvh_build" install PREFIX="\$WORK/nvh12"
+    NVH_VER="12.2-f8339c0"
+    export PKG_CONFIG_PATH="\$WORK/nvh12/lib/pkgconfig:\$PKG_CONFIG_PATH"
+    NVH_CFLAGS=-I"\$WORK/nvh12/include"
     ./configure --prefix="\$WORK/prefix" --pkg-config-flags="--static" \$FFBUILD_TARGET_FLAGS \$FF_CONFIGURE \
         --extra-cflags="\$NVH_CFLAGS \$FF_CFLAGS" --extra-cxxflags="\$FF_CXXFLAGS" --extra-libs="\$FF_LIBS" \
         --extra-ldflags="\$FF_LDFLAGS" --extra-ldexeflags="\$FF_LDEXEFLAGS" \
