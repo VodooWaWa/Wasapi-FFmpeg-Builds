@@ -66,6 +66,15 @@ jobs:
           retention-days: 90
           if-no-files-found: error
 
+      - name: Upload nvh pin check
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nvh-check-${{ matrix.target }}
+          path: nvh_check.txt
+          retention-days: 90
+          if-no-files-found: warn
+
       - name: Upload build log on failure
         if: failure()
         uses: actions/upload-artifact@v4
