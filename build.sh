@@ -135,15 +135,31 @@ cat <<EOF >"$BUILD_SCRIPT"
     #      configure used, proving the 12.2 headers were the ones found.
     # A silent fallback to the BtbN base image's 13.1 would fail both checks.
     NVH_PC_VER="\$(PKG_CONFIG_PATH="\$WORK/nvh12/lib/pkgconfig:\$PKG_CONFIG_PATH" pkg-config --modversion ffnvcodec 2>/dev/null)"
-    FFMPEG_VER_LINE="\$(grep -m1 'FFMPEG_VERSION' "\$WORK/ffmpeg/config.h" 2>/dev/null)"
+    # FFMPEG_VERSION is defined in libavutil/ffversion.h (generated at build time),
+    # NOT in config.h -- grepping config.h is a permanent no-match. If the header
+    # path ever shifts, the version marker is non-fatal below: pkg-config==12.2
+    # is the authoritative pin proof and the -nvh12.2 marker is set from the same
+    # NVH_VER, so it cannot diverge without pkg-config also failing.
+    FFMPEG_VER_LINE="\$(grep -m1 'FFMPEG_VERSION' "\$WORK/ffmpeg/libavutil/ffversion.h" 2>/dev/null)"
+    if [[ -z "\$FFMPEG_VER_LINE" ]]; then
+        FFMPEG_VER_LINE="\$(grep -rhoE 'define FFMPEG_VERSION "[^"]*"' "\$WORK/ffmpeg/libavutil" 2>/dev/null | head -1)"
+    fi
     {
       echo "PKGCONFIG_FFNVCODEC=\$NVH_PC_VER"
       echo "\$FFMPEG_VER_LINE"
     } | tee "\$WORK/nvh_check.txt"
-    if [[ "\$NVH_PC_VER" == 12.2* ]] && echo "\$FFMPEG_VER_LINE" | grep -q "nvh12.2"; then
-        echo "NVH_PIN_OK: 12.2 confirmed (pkg-config=\$NVH_PC_VER, \$FFMPEG_VER_LINE)"
+    NVH_PIN_OK=1
+    if [[ "\$NVH_PC_VER" != 12.2* ]]; then
+        NVH_PIN_OK=0
+        echo "NVH_PIN_FAIL: pkg-config ffnvcodec is '\$NVH_PC_VER', expected 12.2*"
+    fi
+    if [[ -n "\$FFMPEG_VER_LINE" ]] && ! echo "\$FFMPEG_VER_LINE" | grep -q "nvh12.2"; then
+        NVH_PIN_OK=0
+        echo "NVH_PIN_FAIL: FFMPEG_VERSION marker missing -nvh12.2 -> \$FFMPEG_VER_LINE"
+    fi
+    if [[ "\$NVH_PIN_OK" == 1 ]]; then
+        echo "NVH_PIN_OK: 12.2 confirmed (pkg-config=\$NVH_PC_VER, \${FFMPEG_VER_LINE:-<marker not directly readable, pkg-config pin is authoritative>})"
     else
-        echo "NVH_PIN_FAIL: pin not confirmed ->"
         cat "\$WORK/nvh_check.txt"
         echo "::error::nv-codec-headers 12.2 pin did not take effect; binary is NOT pinned"
         exit 1
